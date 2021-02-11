@@ -1,5 +1,5 @@
 
-require 'rb-inotify'
+require_relative 'folder-watcher.rb'
 
 module DragonSync
     class SyncFolder
@@ -14,34 +14,27 @@ module DragonSync
             @mqtt = settings[:mqtt];
             raise ArgumentError, "MQTT connection must be specified!" unless @mqtt.is_a? MQTT::SubHandler
             @mqtt_topic = "#{settings[:mqtt_root] || 'DragonSync'}#{@remote_dir}".chomp('/');
-
-            @local_atime  = Time.at(0);
-            @remote_atime = Time.at(0)
+            
+            @folder_watcher = FolderWatcher.new(@local_dir)
 
             @autopush_delay = settings[:autopush_delay] || 10;
+            @remote_atime = Time.at(0)
+            @remote_last_pulled_atime = Time.at(0)
 
-            @inotify_thread = nil;
             @update_thread = nil;
 
             @mqtt.subscribe_to @mqtt_topic do |data|
                 @remote_atime = Time.at(data.to_f);
 
-                @update_thread&.run() if (@remote_atime - @local_atime) > 1
+                @update_thread&.run() if (@remote_atime - @remote_last_pulled_atime)
             end
 
-            sleep 1
+            @folder_watcher.rescan_files
+            @folder_watcher.on_file_change() { @update_thread&.run }
 
-            determine_local_atime
-
-            start_inotify_thread
             start_update_thread
-        end
 
-        def determine_local_atime()
-            @local_atime = Time.at(`find #{@local_dir} -printf '%T@ '`.split(' ').map() { |i| i.to_f }.max || 0)
-            @update_thread&.run
-
-            nil
+            @folder_watcher.start_inotify
         end
 
         def start_update_thread()
@@ -49,34 +42,45 @@ module DragonSync
 
             @update_thread = Thread.new do
                 loop do
-                    pull_folder if (@remote_atime - @local_atime) > 1
-                    push_folder if ((@local_atime - @remote_atime) > 1) && ((Time.now() - @local_atime) > @autopush_delay)
-
-                    if(@local_atime - @remote_atime) > 1
-                        sleep [1, @autopush_delay - (Time.now() - @local_atime)].max
+                    if @remote_atime > @remote_last_pulled_atime
+                    elsif !@folder_watcher.up_to_date?
+                        sleep [1, @autopush_delay - (Time.now() - @folder_watcher.latest_atime)].max
                     else
-                        Thread.stop()   # Always wait for something to happen
+                        Thread.stop 
                     end
+
+                    # If we have changes that need to be pushed, do so here:
+                    if((!@folder_watcher.up_to_date?()) && 
+                         ((Time.now - @folder_watcher.latest_atime > @autopush_delay) || 
+                         (@remote_atime > @remote_last_pulled_atime)))
+
+                        push_folder
+                    end
+
+                    next unless @folder_watcher.up_to_date?
+
+                    pull_folder if @remote_atime > @remote_last_pulled_atime
                 end
             end
 
             @update_thread.abort_on_exception = true;
         end
 
-        def start_inotify_thread()
-            return unless @inotify_thread.nil?
+        private def generate_file_includes(file_list)
+            file_includes = {};
 
-            @inotify_instance = INotify::Notifier.new
-            @inotify_instance.watch(@local_dir, :recursive, :close_write, :move, :create, :delete) do
-                @local_atime = Time.now
-                @update_thread&.run
+            file_list.each do |fName|
+                file_includes[fName] = true;
+
+                dir_list = fName.split('/')[0..-2];
+                dir_str = '';
+                dir_list.each do |dir|
+                    dir_str += dir + '/';
+                    file_includes[dir_str] = true;
+                end
             end
 
-            @inotify_thread = Thread.new do
-                @inotify_instance.run
-            end
-
-            @inotify_thread.abort_on_exception = true
+            file_includes.keys.map { |fname| "--include=#{fname}"} + ['--exclude=*']
         end
 
         private def call_rsync(from, to, **extra_opts)
@@ -91,40 +95,51 @@ module DragonSync
                 '-m' => true
             };
 
+            file_include_list= [];
+            if(extra_opts.include? :files)
+                file_include_list = generate_file_includes extra_opts[:files]
+                extra_opts.delete :files
+            end
+
             rsync_command_opts.merge!(@settings[:rsync_opts] || {});
 
             rsync_command_opts.merge!(extra_opts);
             rsync_command_opts.keep_if() { |k,v| (v == true) || (v.is_a?(String)) }
 
-            system(*(['rsync', rsync_command_opts.keys, from, to].flatten))
+            rsync_command_list = ['rsync', rsync_command_opts.keys, file_include_list, from, to].flatten
+
+            puts "Rsync command: #{rsync_command_list.join(' ')}"
+
+            system(*rsync_command_list)
         end
 
         def push_folder()
-            puts "Pushing changes to #{@local_dir}"
+            puts "Pushing changes from #{@local_dir}"
+
+            changes = @folder_watcher.get_changes
 
             remote_str = @remote_host.nil? ? @remote_dir : "#{@remote_host}:#{@remote_dir}";
-            return false unless call_rsync(@local_dir, remote_str);
+            return false unless call_rsync(@local_dir, remote_str, files: changes.keys);
 
-            @remote_atime = @local_atime;
-            @mqtt.publish_to @mqtt_topic, @local_atime.to_f, retain: true
+            @folder_watcher.commit_changes changes
 
-            true;
+            @remote_last_pulled_atime = @folder_watcher.latest_atime
+            @remote_atime = @folder_watcher.latest_atime
+
+            @mqtt.publish_to @mqtt_topic, @remote_atime.to_f, retain: true
+
+            true
         end
 
         def pull_folder()
-            puts "Pulling from #{@local_dir}"
+            puts "Pulling to #{@local_dir}"
 
             remote_str = @remote_host.nil? ? @remote_dir : "#{@remote_host}:#{@remote_dir}";
             return false unless call_rsync(remote_str, @local_dir);
 
-            @local_atime = @remote_atime
+            @remote_last_pulled_atime = @remote_atime
+
             true;
-        end
-
-        def notify_change()
-            @local_atime = Time.now();
-
-            @update_thread&.run() if (@local_atime - @remote_atime) > 1
         end
     end
 end
