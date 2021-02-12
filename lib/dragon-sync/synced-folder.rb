@@ -1,6 +1,9 @@
 
 require_relative 'folder-watcher.rb'
 
+require 'json'
+require 'json/add/time'
+
 module DragonSync
     class SyncFolder
         def initialize(settings)
@@ -11,13 +14,16 @@ module DragonSync
             @local_dir = settings[:local_dir]
             @remote_dir = settings[:remote_dir]
 
+            @settings_file = @local_dir.chomp('/') + '/.dsync_cache'
+
             @mqtt = settings[:mqtt];
             raise ArgumentError, "MQTT connection must be specified!" unless @mqtt.is_a? MQTT::SubHandler
             @mqtt_topic = "#{settings[:mqtt_root] || 'DragonSync'}#{@remote_dir}".chomp('/');
             
-            @folder_watcher = FolderWatcher.new(@local_dir)
+            @folder_watcher = FolderWatcher.new(@local_dir, exclude: ['*.dsync_cache']);
 
-            @autopush_delay = settings[:autopush_delay] || 10;
+            @autopush_delay = settings[:autopush_delay] || 1;
+
             @remote_atime = Time.at(0)
             @remote_last_pulled_atime = Time.at(0)
 
@@ -30,11 +36,32 @@ module DragonSync
             end
 
             @folder_watcher.rescan_files
+
+            load_settings
+
             @folder_watcher.on_file_change() { @update_thread&.run }
 
             start_update_thread
 
             @folder_watcher.start_inotify
+        end
+
+        private def save_settings
+            settings = {
+                remote_last_pulled_atime: @remote_last_pulled_atime.to_f,
+                pushed_files: @folder_watcher.commited_files
+            }
+
+            IO.write(@settings_file, JSON.pretty_generate(settings), mode: 'w');
+        end
+
+        private def load_settings
+            return unless File.exist? @settings_file
+
+            new_settings = JSON.load(IO.read(@settings_file));
+
+            @remote_last_pulled_atime = Time.at(new_settings['remote_last_pulled_atime'])
+            @folder_watcher.commit_changes new_settings['pushed_files']
         end
 
         def start_update_thread()
@@ -57,8 +84,9 @@ module DragonSync
                         push_folder
                     end
 
+                    # Only allow pulling changes if we are up to date, else we run the risk of
+                    # overwriting created files!
                     next unless @folder_watcher.up_to_date?
-
                     pull_folder if @remote_atime > @remote_last_pulled_atime
                 end
             end
@@ -91,11 +119,13 @@ module DragonSync
                 '-u' => true,
                 '-t' => true,
                 '-E' => true,
+                '-a' => true,
                 '--delete' => true,
-                '-m' => true
+                '-m' => true,
+                '--exclude=**.dsync-cache' => true
             };
 
-            file_include_list= [];
+            file_include_list = [];
             if(extra_opts.include? :files)
                 file_include_list = generate_file_includes extra_opts[:files]
                 extra_opts.delete :files
@@ -108,13 +138,13 @@ module DragonSync
 
             rsync_command_list = ['rsync', rsync_command_opts.keys, file_include_list, from, to].flatten
 
-            puts "Rsync command: #{rsync_command_list.join(' ')}"
+            puts "Running #{rsync_command_list.join(' ')}"
 
             system(*rsync_command_list)
         end
 
         def push_folder()
-            puts "Pushing changes from #{@local_dir}"
+            puts "Pushing changes..."
 
             changes = @folder_watcher.get_changes
 
@@ -123,10 +153,9 @@ module DragonSync
 
             @folder_watcher.commit_changes changes
 
-            @remote_last_pulled_atime = @folder_watcher.latest_atime
-            @remote_atime = @folder_watcher.latest_atime
+            save_settings
 
-            @mqtt.publish_to @mqtt_topic, @remote_atime.to_f, retain: true
+            @mqtt.publish_to @mqtt_topic, changes.values.max.to_f, retain: true
 
             true
         end
@@ -138,6 +167,8 @@ module DragonSync
             return false unless call_rsync(remote_str, @local_dir);
 
             @remote_last_pulled_atime = @remote_atime
+
+            save_settings
 
             true;
         end

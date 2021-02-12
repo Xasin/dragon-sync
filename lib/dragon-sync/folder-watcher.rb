@@ -8,9 +8,10 @@ module DragonSync
 
 		attr_reader :latest_atime
 
-		def initialize(folder_dir)
+		def initialize(folder_dir, exclude: [])
 			@root = File.expand_path(folder_dir) + '/'
 
+			@exclude_patterns = exclude
 			@known_files = {}
 			
 			# 'Commited files' contains records of all files that
@@ -18,7 +19,6 @@ module DragonSync
 			# If an entry of @known_files contains the equivalent atime to that
 			# of the commited file entry, it has been dealt with
 			@commited_files = {}
-
 
 			@latest_atime = Time.at(0)
 
@@ -29,6 +29,14 @@ module DragonSync
 	
 		def on_file_change(&block)
 			@on_file_change = block
+		end
+
+		def is_excluded?(fname)
+			@exclude_patterns.each do |pattern|
+				return true if File.fnmatch(pattern, fname, File::FNM_DOTMATCH);
+			end
+
+			return false
 		end
 
 		def rescan_files
@@ -44,6 +52,8 @@ module DragonSync
 					
 					file_name  = match[1]
 					file_atime = Time.at(match[2].to_f)
+
+					next if is_excluded? file_name
 
 					@known_files[file_name] = file_atime
 				end
@@ -64,6 +74,8 @@ module DragonSync
 					:recursive, :close_write, :move, :create, :delete) do |event|
 		
 					file_name = event.absolute_name.gsub(@root, '');
+					
+					next if is_excluded? file_name
 
 					@file_mutex.synchronize do
 						if (event.flags.include? :delete) || (event.flags.include? :move_from)
@@ -85,7 +97,13 @@ module DragonSync
 		end
 
 		def up_to_date?
-			return @known_files == @commited_files
+			return false if @known_files.keys.sort != @commited_files.keys.sort
+
+			@commited_files.each do |file_name, file_atime|
+				return false if @known_files[file_name] > file_atime
+			end
+
+			return true
 		end
 
 		def get_changes
@@ -108,7 +126,7 @@ module DragonSync
 			@file_mutex.synchronize do
 				changes.keys.each do |file|
 					if(@known_files.include? file)
-						@commited_files[file] = changes[file]
+						@commited_files[file] = [@commited_files[file] || Time.at(0), changes[file]].max
 					else
 						@commited_files.delete file
 					end
